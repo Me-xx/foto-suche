@@ -1,2 +1,6 @@
 /.venv
 /docs
+*.pyc
+*.xlsx
+index.db
+config.yaml

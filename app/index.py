@@ -30,19 +30,20 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS images (
-    image_id     INTEGER PRIMARY KEY,
-    path         TEXT,
-    name         TEXT,
-    caption      TEXT,
-    caption_hash TEXT,
-    rating       INTEGER,
-    lat          REAL,
-    lon          REAL,
-    taken        TEXT,
-    embedding    BLOB,
-    embedded     INTEGER DEFAULT 0,
-    embedded_at  TEXT,
-    updated_at   TEXT
+    image_id      INTEGER PRIMARY KEY,
+    path          TEXT,
+    name          TEXT,
+    caption       TEXT,
+    caption_hash  TEXT,
+    rating        INTEGER,
+    lat           REAL,
+    lon           REAL,
+    taken         TEXT,
+    embedding     BLOB,
+    embedded_hash TEXT,
+    embedded      INTEGER DEFAULT 0,
+    embedded_at   TEXT,
+    updated_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tags (
@@ -62,8 +63,9 @@ CREATE INDEX IF NOT EXISTS idx_images_rating ON images(rating);
 CREATE INDEX IF NOT EXISTS idx_images_embedded ON images(embedded);
 """
 
-# Migration: ALTER TABLE falls die Spalte 'embedding' noch fehlt
+# Migration: ALTER TABLE, falls Spalten aus einer älteren Index-Version fehlen
 _MIGRATION_EMBEDDING = "ALTER TABLE images ADD COLUMN embedding BLOB"
+_MIGRATION_EMBEDDED_HASH = "ALTER TABLE images ADD COLUMN embedded_hash TEXT"
 
 
 def caption_hash(text: str) -> str:
@@ -76,11 +78,17 @@ def open_index_db(db_path: str, dimension: int = 1024) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
 
-    # Migration: embedding-Spalte nachträglich hinzufügen, falls die
-    # Tabelle aus einer älteren Version ohne diese Spalte stammt.
+    # Migrationen: fehlende Spalten nachträglich hinzufügen.
     cols = [r[1] for r in conn.execute("PRAGMA table_info(images)")]
     if "embedding" not in cols:
         conn.execute(_MIGRATION_EMBEDDING)
+    if "embedded_hash" not in cols:
+        conn.execute(_MIGRATION_EMBEDDED_HASH)
+        # Einmaliger Backfill: bereits embedded Captions gelten als aktuell
+        conn.execute(
+            "UPDATE images SET embedded_hash = caption_hash "
+            "WHERE embedded = 1 AND caption_hash IS NOT NULL"
+        )
 
     conn.commit()
     return conn
@@ -91,19 +99,36 @@ def sync_metadata(
 ) -> dict[str, int]:
     """Synchronisiert Bild-Metadaten und Tags aus digiKam in die Index-DB.
 
-    Inkrementell: nur Bilder mit id > last_sync_id werden aktualisiert.
+    Vollständiger, idempotenter Abgleich: alle Bilder werden gelesen und
+    per caption_hash mit dem Index verglichen.  Geänderte Captions werden
+    aktualisiert und (per embedded=0) zur Neu-Embedding markiert; geleerte
+    Captions verlieren ihr Embedding.  Nicht mehr vorhandene Bilder werden
+    aus dem Index gelöscht.
     """
-    cur = conn.execute(
-        "SELECT value FROM meta WHERE key = 'last_sync_image_id'"
-    )
-    row = cur.fetchone()
-    since = int(row[0]) if row else 0
+    cur = conn.execute("SELECT image_id, caption_hash, path FROM images")
+    existing: dict[int, tuple] = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
 
-    n_images = 0
+    n_new = 0
+    n_changed = 0
+    seen: set[int] = set()
     batch: list[tuple] = []
 
-    for rec in dk.iter_images(since_image_id=since):
+    def _flush() -> None:
+        nonlocal batch
+        if batch:
+            _upsert_images(conn, batch)
+            batch = []
+
+    for rec in dk.iter_images():
+        seen.add(rec.image_id)
         ch = caption_hash(rec.caption) if rec.caption else None
+        old = existing.get(rec.image_id)
+        if old is not None and old[0] == ch and old[1] == rec.path:
+            continue  # unverändert
+        if old is None:
+            n_new += 1
+        else:
+            n_changed += 1
         batch.append(
             (
                 rec.image_id,
@@ -118,25 +143,26 @@ def sync_metadata(
             )
         )
         if len(batch) >= batch_size:
-            _upsert_images(conn, batch)
-            n_images += len(batch)
-            batch = []
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_sync_image_id', ?)",
-                (str(rec.image_id),),
-            )
+            _flush()
             conn.commit()
-            print(f"\r  Metadaten: {n_images} Bilder synchronisiert", end="", flush=True)
+            print(
+                f"\r  Metadaten: {n_new} neu, {n_changed} geändert",
+                end="", flush=True,
+            )
 
-    if batch:
-        _upsert_images(conn, batch)
-        n_images += len(batch)
+    _flush()
+    conn.commit()
 
-    if n_images > 0:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_sync_image_id', ?)",
-            (str(rec.image_id),),
+    # Im Index löschen, was digiKam nicht mehr kennt
+    removed = [iid for iid in existing if iid not in seen]
+    if removed:
+        conn.executemany(
+            "DELETE FROM image_tags WHERE image_id = ?", [(iid,) for iid in removed]
         )
+        conn.executemany(
+            "DELETE FROM images WHERE image_id = ?", [(iid,) for iid in removed]
+        )
+        conn.commit()
 
     # Tags synchronisieren (Vollsync — Tags sind klein)
     conn.execute("DELETE FROM tags")
@@ -174,12 +200,20 @@ def sync_metadata(
     )
     conn.commit()
 
-    print(f"\r  Metadaten: {n_images} Bilder, {n_tags} Tags synchronisiert.        ")
-    return {"images": n_images, "tags": n_tags}
+    print(
+        f"\r  Metadaten: {n_new} neu, {n_changed} geändert, "
+        f"{len(removed)} entfernt, {n_tags} Tags synchronisiert.        "
+    )
+    return {
+        "images_new": n_new,
+        "images_changed": n_changed,
+        "images_removed": len(removed),
+        "tags": n_tags,
+    }
 
 
 def _upsert_images(conn: sqlite3.Connection, batch: list[tuple]) -> None:
-    """Upsert ohne embedding-Spalte (wird nur beim Embedding-Lauf gesetzt)."""
+    """Upsert; Embedding bleibt nur erhalten, wenn die Caption unverändert ist."""
     conn.executemany(
         """
         INSERT INTO images (image_id, path, name, caption, caption_hash,
@@ -190,6 +224,12 @@ def _upsert_images(conn: sqlite3.Connection, batch: list[tuple]) -> None:
             caption=excluded.caption, caption_hash=excluded.caption_hash,
             rating=excluded.rating, lat=excluded.lat, lon=excluded.lon,
             taken=excluded.taken,
+            embedded = CASE WHEN images.caption_hash IS NOT excluded.caption_hash
+                            THEN 0 ELSE images.embedded END,
+            embedding = CASE WHEN images.caption_hash IS NOT excluded.caption_hash
+                            THEN NULL ELSE images.embedding END,
+            embedded_hash = CASE WHEN images.caption_hash IS NOT excluded.caption_hash
+                            THEN NULL ELSE images.embedded_hash END,
             updated_at=CURRENT_TIMESTAMP
         """,
         batch,
@@ -241,13 +281,15 @@ def run_embeddings(
         print(f"  WARNUNG: Modell-Dimension {actual_dim} != config {dimension}, verwende {actual_dim}")
         dimension = actual_dim
 
-    # Bilder, die neu embeddet werden müssen (embedded = 0)
+    # Bilder, die (neu) embeddet werden müssen: noch nicht embedded oder
+    # Caption hat sich seit dem letzten Embedding geändert (Hash-Abgleich)
     sql = """
-        SELECT image_id, caption
+        SELECT image_id, caption, caption_hash
           FROM images
          WHERE caption IS NOT NULL
            AND caption != ''
-           AND (embedded = 0 OR embedded IS NULL)
+           AND (embedded = 0 OR embedded IS NULL
+                OR embedded_hash IS NULL OR embedded_hash != caption_hash)
          ORDER BY image_id
     """
     if limit:
@@ -257,28 +299,28 @@ def run_embeddings(
     rows = cur.fetchall()
 
     if not rows:
-        print("Keine neuen Captions zu embedden — alles aktuell.")
+        print("Keine neuen/geänderten Captions zu embedden — alles aktuell.")
         return {"embedded": 0, "skipped": 0}
 
     print(f"  {len(rows)} Captions zu embedden …")
 
     n_done = 0
-    buf_ids: list[int] = []
-    buf_texts: list[str] = []
+    buf: list[tuple] = []  # (image_id, text, caption_hash)
 
-    for row in rows:
-        buf_ids.append(row[0])
-        buf_texts.append(row[1])
-        if len(buf_texts) >= batch_size:
-            _embed_batch(conn, model, buf_ids, buf_texts)
-            n_done += len(buf_ids)
-            buf_ids = []
-            buf_texts = []
+    def _flush() -> None:
+        nonlocal buf, n_done
+        if buf:
+            _embed_batch(conn, model, buf)
+            n_done += len(buf)
+            buf = []
             print(f"\r  Embedding: {n_done} / {len(rows)}", end="", flush=True)
 
-    if buf_ids:
-        _embed_batch(conn, model, buf_ids, buf_texts)
-        n_done += len(buf_ids)
+    for row in rows:
+        buf.append((row[0], row[1], row[2]))
+        if len(buf) >= batch_size:
+            _flush()
+
+    _flush()
 
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_embed_at', ?)",
@@ -292,16 +334,19 @@ def run_embeddings(
 def _embed_batch(
     conn: sqlite3.Connection,
     model: Any,
-    ids: list[int],
-    texts: list[str],
+    buf: list[tuple],  # (image_id, text, caption_hash)
 ) -> None:
+    ids = [b[0] for b in buf]
+    texts = [b[1] for b in buf]
+    hashes = [b[2] for b in buf]
     embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
-    for img_id, emb in zip(ids, embeddings):
+    for img_id, emb, ch in zip(ids, embeddings, hashes):
         blob = _embedding_to_blob(emb)
         conn.execute(
-            "UPDATE images SET embedded = 1, embedding = ?, embedded_at = CURRENT_TIMESTAMP WHERE image_id = ?",
-            (blob, img_id),
+            "UPDATE images SET embedded = 1, embedding = ?, embedded_hash = ?, "
+            "embedded_at = CURRENT_TIMESTAMP WHERE image_id = ?",
+            (blob, ch, img_id),
         )
     conn.commit()
 

@@ -40,11 +40,11 @@ dlna:
   max_versions: 5
 
 syncthing:
-  sync_dir: "C:/MeineDateienDesk/Syncthing/Daten"
+  sync_dir: "C:/SycnT_Server"          # Syncthing-Folder "ServerDaten" (id: daten)
   subfolder_pattern: "Bilder/Auswahl/{jahr}"
   api_url: null       # Optional: http://localhost:8384
   api_key: null       # Optional
-  folder_id: null     # Optional
+  folder_id: "daten"  # Optional (Scan-Trigger)
 ```
 
 ### 3. Index aufbauen (Metadaten + Embeddings)
@@ -162,7 +162,7 @@ foto-suche/
 
 Vor dem produktiven Einsatz in `config.yaml` klären:
 
-1. Exakter Pfad des lokalen Syncthing-Ordners „Daten"
+1. ~~Exakter Pfad des lokalen Syncthing-Ordners~~ geklärt: `C:/SycnT_Server` (Folder „ServerDaten", id `daten`)
 2. Gewünschte Ziel-Struktur für Syncthing-Push (`subfolder_pattern`)
 3. GPU verfügbar? (Modellwahl/Speed — CPU reicht, ist aber langsamer)
 4. digiKam-Version (Schema-Verifikation erfolgt automatisch beim Sync)

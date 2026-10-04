@@ -144,17 +144,24 @@ class DigiKamReader:
         return [r[0] for r in cur.fetchall()]
 
     def get_image_tags_map(self, image_ids: list[int]) -> dict[int, list[int]]:
-        """Mapping image_id → [tag_id, ...] für eine Menge von Bildern."""
+        """Mapping image_id → [tag_id, ...] für eine Menge von Bildern.
+
+        Wird in Batches abgefragt, da SQLite die Anzahl der SQL-Variablen
+        pro Statement begrenzt.
+        """
         if not image_ids:
             return {}
-        placeholders = ",".join("?" * len(image_ids))
-        cur = self.conn.execute(
-            f"SELECT imageid, tagid FROM ImageTags WHERE imageid IN ({placeholders})",
-            image_ids,
-        )
         result: dict[int, list[int]] = {}
-        for r in cur.fetchall():
-            result.setdefault(r[0], []).append(r[1])
+        batch_size = 500
+        for start in range(0, len(image_ids), batch_size):
+            chunk = image_ids[start:start + batch_size]
+            placeholders = ",".join("?" * len(chunk))
+            cur = self.conn.execute(
+                f"SELECT imageid, tagid FROM ImageTags WHERE imageid IN ({placeholders})",
+                chunk,
+            )
+            for r in cur.fetchall():
+                result.setdefault(r[0], []).append(r[1])
         return result
 
     def filter_by_tags(self, tag_ids: list[int]) -> set[int]:

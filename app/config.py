@@ -31,12 +31,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "output_dir": "C:/MeineDateienDesk/dlna/suche",
         "max_versions": 5,
     },
+    "caption_check": {
+        # Lokales Qwen2-VL-Verzeichnis für den LLM-Merge (INT4, GPU)
+        "llm_model_path": "C:/MeineDateienDesk/MCP/models/Qwen2VL",
+        # Wohin die descriptError-Excel geschrieben wird (App-Verzeichnis)
+        "excel_dir": None,
+    },
     "syncthing": {
-        "sync_dir": "C:/MeineDateienDesk/Syncthing/Daten",
+        # Lokaler Syncthing-Ordner "ServerDaten" (folder id: daten, send-only)
+        "sync_dir": "C:/SycnT_Server",
         "subfolder_pattern": "Bilder/Auswahl/{jahr}",
         "api_url": None,
         "api_key": None,
-        "folder_id": None,
+        "folder_id": "daten",
     },
 }
 
