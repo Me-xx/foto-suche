@@ -3,6 +3,10 @@
 r"""
 Diashow aus allen Bildern eines Ordners + optional ein MP3 als Musik.
 
+Die Bilder werden in eine concat-Liste geschrieben und ffmpeg als EIN
+Input uebergeben (-f concat) -- die Kommandozeile bleibt dadurch kurz,
+egal wie viele Bilder es sind. Dauer pro Bild = duration in der Liste.
+
 Aufruf:
     python makeVideo.py                          # Bilder aus dem aktuellen Ordner, ohne Musik
     python makeVideo.py -d C:\Fotos\2026        # Bildordner per Parameter
@@ -20,14 +24,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 BILDER_ENDUNGEN = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic"}
 
 # Pillow benutzen, falls vorhanden (empfohlen): "pip install pillow"
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     Image = None
+    ImageOps = None
 
 
 def _datum_aus_text(text: str) -> tuple | None:
@@ -172,6 +178,41 @@ def finde_bilder(ordner: str) -> list[str]:
     return [e[3] for e in eintraege]
 
 
+def bereite_bilder(bilder: list[str], zielordner: str) -> tuple[list[str], int]:
+    """Kopiert die Bilder nach zielordner und rechnet die EXIF-Orientierung
+    physisch ein (ffmpeg ignoriert das Orientation-Tag -> Bilder waeren im
+    Video verdreht). Bilder ohne Drehung werden 1:1 kopiert.
+
+    Rueckgabe: (liste der vorbereiteten Pfade, Anzahl gedrehter Bilder)
+    """
+    out = []
+    gedreht = 0
+    for i, b in enumerate(bilder):
+        ziel = os.path.join(zielordner, f"{i:05d}_{os.path.basename(b)}")
+        ori = 1
+        if Image is not None:
+            try:
+                ori = int(Image.open(b).getexif().get(274, 1)) or 1
+            except Exception:
+                ori = 1
+        if ori in (0, 1) or ImageOps is None:
+            shutil.copy2(b, ziel)
+        else:
+            try:
+                img = ImageOps.exif_transpose(Image.open(b))
+                ext = os.path.splitext(ziel)[1].lower()
+                if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                    img.save(ziel)
+                else:
+                    ziel = os.path.splitext(ziel)[0] + ".jpg"
+                    img.convert("RGB").save(ziel, quality=95)
+                gedreht += 1
+            except Exception:
+                shutil.copy2(b, ziel)
+        out.append(ziel)
+    return out, gedreht
+
+
 def finde_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
     if exe:
@@ -196,32 +237,10 @@ def musik_dauer_s(pfad: str) -> float:
     return float(pr.stdout.strip())
 
 
-def baue_filter(bilder: list[str], pro_bild_s: float, xfade_s: float,
-                breite: int, hoehe: int) -> tuple[str, float]:
-    """Erzeugt die filter_complex-Kette mit xfade-Überblendungen.
-
-    Rueckgabe: (filter_string, gesamtlaenge_s)
-    """
-    parts = []
-    for i in range(len(bilder)):
-        parts.append(
-            f"[{i}:v]scale={breite}:{hoehe}:force_original_aspect_ratio=decrease,"
-            f"pad={breite}:{hoehe}:-1:-1:color=black,setsar=1[s{i}]"
-        )
-
-    gesamt = pro_bild_s
-    if len(bilder) == 1:
-        return parts[0], gesamt
-
-    prev = "s0"
-    offset = pro_bild_s - xfade_s
-    for i in range(1, len(bilder)):
-        label = f"x{i}" if i < len(bilder) - 1 else "v"
-        parts.append(f"[{prev}][s{i}]xfade=transition=fade:duration={xfade_s}:offset={offset:.3f}[{label}]")
-        prev = label
-        offset += pro_bild_s - xfade_s
-        gesamt = offset + xfade_s
-    return ";".join(parts), gesamt
+def baue_vf(breite: int, hoehe: int) -> str:
+    """Video-Filterkette: skalieren, auf Zielgroesse padden, yuv420p."""
+    return (f"scale={breite}:{hoehe}:force_original_aspect_ratio=decrease,"
+            f"pad={breite}:{hoehe}:-1:-1:color=black,setsar=1,format=yuv420p")
 
 
 def main() -> None:
@@ -229,7 +248,6 @@ def main() -> None:
     ap.add_argument("musik", nargs="?", help="MP3/WAV-Datei als Musikuntermalung (relativ zum Bildordner oder absolut)")
     ap.add_argument("-d", "--ordner", default=".", help="Ordner mit den Bildern (Default: aktueller Ordner)")
     ap.add_argument("-t", "--dauer", type=float, default=4.0, help="Sekunden pro Bild (Default 4)")
-    ap.add_argument("-x", "--uebergang", type=float, default=1.0, help="Ueberblenddauer in Sekunden (Default 1)")
     ap.add_argument("-r", "--aufloesung", default="1920x1080", help="Zielaufloesung (Default 1920x1080)")
     ap.add_argument("-o", "--output", default="show.mp4", help="Ausgabedatei (Default show.mp4, relativ zum Bildordner)")
     ap.add_argument("--fit-musik", action="store_true",
@@ -247,6 +265,12 @@ def main() -> None:
         print(f"FEHLER: keine Bilder in {ordner} gefunden.")
         sys.exit(1)
     print(f"{len(bilder)} Bilder gefunden.")
+
+    # EXIF-Orientierung physisch einrechnen, bevor die concat-Liste gebaut wird
+    prep_dir = tempfile.mkdtemp(prefix="makeVideo_bilder_")
+    bilder, gedreht = bereite_bilder(bilder, prep_dir)
+    if gedreht:
+        print(f"{gedreht} Bilder per EXIF-Orientierung gedreht.")
 
     # Musik: Pfad relativ zum Bildordner, sonst relativ zum aktuellen Ordner/ absolut
     musik = None
@@ -266,43 +290,62 @@ def main() -> None:
             sys.exit(1)
         md = musik_dauer_s(musik)
         n = len(bilder)
-        # Gesamtlaenge = n * (dauer - uebergang) + uebergang
-        args.dauer = (md - args.uebergang) / n + args.uebergang
-        if args.dauer <= args.uebergang:
-            print("FEHLER: Musik zu kurz fuer die Anzahl der Bilder bei diesem Uebergang.")
-            sys.exit(1)
-        print(f"Musiklaenge: {md:.3f} s -> Dauer pro Bild: {args.dauer:.3f} s "
-              f"({n} Bilder, Uebergang {args.uebergang} s)")
+        # Gesamtlaenge = n * dauer  =>  dauer = musiklaenge / n
+        args.dauer = md / n
+        print(f"Musiklaenge: {md:.3f} s -> Dauer pro Bild: {args.dauer:.3f} s ({n} Bilder)")
 
     breite, hoehe = (int(x) for x in args.aufloesung.lower().split("x"))
     ffmpeg = finde_ffmpeg()
 
-    cmd = [ffmpeg, "-y"]
-    for b in bilder:
-        cmd += ["-loop", "1", "-t", str(args.dauer), "-i", b]
-    if musik:
-        cmd += ["-i", musik]
+    # Bilder in eine concat-Datei schreiben: ffmpeg bekommt EINEN Input
+    # (-f concat), die Kommandozeile bleibt kurz -- egal wie viele Bilder
+    # (kein WinError 206 "Dateiname zu lang" mehr).
+    fd, concat_datei = tempfile.mkstemp(prefix="makeVideo_concat_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("ffconcat version 1.0\n")
+        for b in bilder:
+            p = b.replace("\\", "/").replace("'", "\\'")
+            f.write(f"file '{p}'\n")
+            f.write(f"duration {args.dauer:.6f}\n")
+        # letzte Datei wiederholen, sonst ignoriert der concat-Demuxer
+        # die letzte duration
+        p = bilder[-1].replace("\\", "/").replace("'", "\\'")
+        f.write(f"file '{p}'\n")
 
-    filt, gesamt = baue_filter(bilder, args.dauer, args.uebergang, breite, hoehe)
-    if musik:
-        # Audio komplett im filter_complex verarbeiten (afade + apad),
-        # damit das Lied sauber auf die Videolaenge angepasst wird.
-        m = len(bilder)
-        filt += (f";[{m}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-                 f"afade=t=out:st={max(0, gesamt - 3):.2f}:d=3,"
-                 f"apad[a]")
-    cmd += ["-filter_complex", filt, "-map", "[v]"]
-    if musik:
-        cmd += ["-map", "[a]"]
+    n = len(bilder)
+    gesamt = n * args.dauer   # VFR: jedes Bild dauert args.dauer Sekunden
 
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30"]
+    cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_datei]
     if musik:
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-t", f"{gesamt:.3f}"]
+        cmd += ["-i", musik, "-map", "0:v", "-map", "1:a"]
+    else:
+        cmd += ["-map", "0:v"]
+    cmd += ["-vf", baue_vf(breite, hoehe)]
+    if musik:
+        # Audio per -af auf exakt gesamt Sekunden schneiden (atrim) und
+        # am Ende ausblenden (afade). Video laeuft VFR bis N*dauer + 0.04 s
+        # (der wiederholte letzte Frame) -- ohne -r/fps, das die duration
+        # des concat-Streams verzerren wuerde.
+        cmd += ["-af", (f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"atrim=0:{gesamt:.3f},asetpts=PTS-STARTPTS,"
+                        f"afade=t=out:st={max(0, gesamt - 3):.2f}:d=3")]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if musik:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
     cmd += [output]
 
     print(f"Gesamtlaenge des Videos: ~{gesamt:.0f} Sekunden.")
     print("Starte ffmpeg ...")
-    r = subprocess.run(cmd)
+    try:
+        r = subprocess.run(cmd)
+    except OSError as e:
+        print(f"FEHLER: ffmpeg konnte nicht gestartet werden: {e}")
+        r = None
+    finally:
+        os.remove(concat_datei)
+        shutil.rmtree(prep_dir, ignore_errors=True)
+    if r is None:
+        sys.exit(1)
     if r.returncode != 0:
         print("FEHLER: ffmpeg wurde mit Fehlercode", r.returncode, "beendet.")
         sys.exit(r.returncode)
