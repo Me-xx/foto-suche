@@ -124,6 +124,49 @@ App automatisch auf Kopieren zurück und zeigt einen Warnhinweis.
 Alle Filter sind kombinierbar: SQL-Filter vorfiltern, dann Vektor-
 Ranking auf der Teilmenge (Hybrid-Suche).
 
+## Caption-Bereinigung (descriptError)
+
+Der Qwen-Tagger erzeugt teils redundante oder defekte Captions (Mojibake,
+Null-Bytes, Software-Artefakte wie „Created with GIMP", wiederholte Segmente).
+
+```powershell
+# 1. Analyse: schreibt descriptError_<Datum-Uhrzeit>.xlsx
+.\descript-check.ps1
+
+# 2. Excel prüfen und markieren:
+#    'x' in 'merge description'  -> Caption wird per LLM (Qwen2-VL, GPU) zusammengefasst
+#    'x' in 'cleanup description' -> Caption wird geleert (Tagger taggt neu)
+
+# 3. Anwenden (erst mit -DryRun testen, Backup der DB wird automatisch angelegt):
+.\descript-apply.ps1 .\descriptError_<...>.xlsx -DryRun
+.\descript-apply.ps1 .\descriptError_<...>.xlsx
+```
+
+Danach den Qwen-Tagger über die ungetaggten Bilder laufen lassen und
+anschließend `sync-only.ps1` + `embed-only.ps1` — der Sync erkennt
+geänderte Captions per Hash-Vergleich und lässt nur diese neu embedden.
+
+## Tag-Bereinigung (tagMerge)
+
+Gleichnamige Tags (z.B. `Backpack` vs. `backpack` aus zwei Tagger-Bäumen)
+werden zusammengeführt.
+
+```powershell
+# 1. Analyse: schreibt tagMerge_<Datum-Uhrzeit>.xlsx mit Vorschlag
+.\tag-check.ps1
+
+# 2. Excel prüfen: Spalte 'neue Tag ID' — der Tag mit den meisten
+#    Zuordnungen bleibt; Ziele können geändert/geleert werden.
+
+# 3. Anwenden (erst -DryRun testen, DB-Backup wird automatisch angelegt):
+.\tag-apply.ps1 .\tagMerge_<...>.xlsx -DryRun
+.\tag-apply.ps1 .\tagMerge_<...>.xlsx
+```
+
+Der Apply überträgt alle ImageTags-Zuordnungen auf den Ziel-Tag, entfernt
+Duplikate und löscht den leeren Quell-Tag (inkl. TagProperties).
+Danach `sync-only.ps1` laufen lassen, um den Tag-Index zu aktualisieren.
+
 ## Bedienung
 
 1. Suchbegriff eingeben und/oder Filter setzen.
@@ -131,6 +174,11 @@ Ranking auf der Teilmenge (Hybrid-Suche).
 3. Checkboxen für Bilder anwählen.
 4. **„Treffer an Beamer"**: alle Treffer als Hardlinks im DLNA-Ordner.
 5. **„Auswahl → Homelab"**: angehakte Bilder in Syncthing-Ordner kopieren.
+6. **„Auswahl → Homelab als Video"**: Diashow aus den angehakten Bildern
+   (nach Aufnahmedatum sortiert, Überblendungen, optionaler MP3-Soundtrack
+   aus der Sidebar-Konfiguration) per ffmpeg rendern und als MP4 nach
+   `Videos/Auswahl/<Jahr>/` im Syncthing-Ordner kopieren.
+   Voraussetzung: ffmpeg im PATH (`winget install Gyan.FFmpeg`).
 
 ## Bekannte Einschränkungen
 

@@ -41,6 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Lokaler Syncthing-Ordner "ServerDaten" (folder id: daten, send-only)
         "sync_dir": "C:/SycnT_Server",
         "subfolder_pattern": "Bilder/Auswahl/{jahr}",
+        "video_subfolder_pattern": "Videos/Auswahl/{jahr}",
         "api_url": None,
         "api_key": None,
         "folder_id": "daten",

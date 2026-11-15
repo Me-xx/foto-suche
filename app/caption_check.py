@@ -237,11 +237,14 @@ class Action:
     current_caption: Optional[str]
 
 
-def read_actions(excel_path: Path, db_path: str) -> tuple[list[Action], list[str]]:
+def read_actions(
+    excel_path: Path, db_path: str, image_root: str = ""
+) -> tuple[list[Action], list[str]]:
     """Liest die markierten Zeilen aus der Excel ein.
 
     Nur Zeilen mit 'x' in 'merge description' oder 'cleanup description'
-    werden als Aktion übernommen.  Zurückgegeben werden zusätzlich
+    werden als Aktion übernommen.  Aufgelöst wird primär über die ImageID-
+    Spalte, alternativ über den Dateipfad.  Zurückgegeben werden zusätzlich
     Warnungen (z.B. Zeilen mit beiden Marken oder nicht gefundenen Bildern).
     """
     import openpyxl
@@ -263,6 +266,34 @@ def read_actions(excel_path: Path, db_path: str) -> tuple[list[Action], list[str
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
+    def _by_image_id(img_id: int) -> Optional[sqlite3.Row]:
+        return conn.execute(
+            "SELECT i.id, ic.comment FROM Images i "
+            "LEFT JOIN ImageComments ic ON ic.imageid = i.id AND ic.type = 1 "
+            "WHERE i.id = ?",
+            (img_id,),
+        ).fetchone()
+
+    def _by_path(path: str) -> Optional[sqlite3.Row]:
+        # Pfad (ohne image_root) in Album + Name zerlegen
+        root = image_root.rstrip("/\\").replace("\\", "/").lower()
+        fn = path.replace("\\", "/")
+        if root and fn.lower().startswith(root + "/"):
+            rel = fn[len(root) + 1:]
+        else:
+            rel = fn
+        if "/" in rel:
+            album, name = rel.rsplit("/", 1)
+        else:
+            album, name = "", rel
+        return conn.execute(
+            "SELECT i.id, ic.comment FROM Images i "
+            "JOIN Albums a ON i.album = a.id "
+            "LEFT JOIN ImageComments ic ON ic.imageid = i.id AND ic.type = 1 "
+            "WHERE i.name = ? COLLATE NOCASE AND a.relativePath = ? COLLATE NOCASE",
+            (name, "/" + album if album else ""),
+        ).fetchone()
+
     actions: list[Action] = []
     warnings: list[str] = []
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -278,39 +309,18 @@ def read_actions(excel_path: Path, db_path: str) -> tuple[list[Action], list[str
             warnings.append(f"Beide Spalten markiert — übersprungen: {filename}")
             continue
 
-        cur = conn.execute(
-            """
-            SELECT i.id, ic.comment
-              FROM Images i
-              JOIN Albums a ON i.album = a.id
-             WHERE i.name = ?
-               AND (a.relativePath || '/' || ?) LIKE ('%' || ?)
-             LIMIT 1
-            """,
-            (Path(filename).name, Path(filename).name, filename.replace("\\", "/")),
-        )
-        r = cur.fetchone()
+        r = None
+        idcol = header.get("ImageID")
+        if idcol and row[idcol - 1]:
+            try:
+                r = _by_image_id(int(row[idcol - 1]))
+            except (TypeError, ValueError):
+                r = None
         if r is None:
-            # Fallback: exakter Match über ImageID-Spalte, falls vorhanden
-            idcol = header.get("ImageID")
-            img_id = None
-            if idcol and row[idcol - 1]:
-                try:
-                    img_id = int(row[idcol - 1])
-                except (TypeError, ValueError):
-                    img_id = None
-            if img_id is None:
-                warnings.append(f"Bild nicht gefunden — übersprungen: {filename}")
-                continue
-            r = conn.execute(
-                "SELECT i.id, ic.comment FROM Images i "
-                "LEFT JOIN ImageComments ic ON ic.imageid = i.id AND ic.type = 1 "
-                "WHERE i.id = ?",
-                (img_id,),
-            ).fetchone()
-            if r is None:
-                warnings.append(f"ImageID {img_id} nicht gefunden: {filename}")
-                continue
+            r = _by_path(filename)
+        if r is None:
+            warnings.append(f"Bild nicht gefunden — übersprungen: {filename}")
+            continue
         actions.append(
             Action(
                 image_id=r["id"],
@@ -402,7 +412,9 @@ def run_apply(
     db_override: Optional[str] = None,
 ) -> int:
     db_path = db_override or cfg["digikam"]["db_path"]
-    actions, warnings = read_actions(excel_path, db_path)
+    actions, warnings = read_actions(
+        excel_path, db_path, image_root=cfg["digikam"]["image_root"]
+    )
     for w in warnings:
         print(f"  WARNUNG: {w}")
 
